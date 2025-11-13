@@ -6,7 +6,7 @@ from typing import Tuple
 import torch
 import torch.nn as nn
 
-from gconv import PlainFirstLayer
+from gconv import GroupConvFirstLayer
 
 
 class Conv2dBlock(nn.Module):
@@ -41,27 +41,12 @@ def _make_backbone() -> nn.Sequential:
     return nn.Sequential(*layers)
 
 
-class GroupConvFirstLayer(nn.Module):
-    """普通卷积实现的第一层，不依赖扰动参数。"""
-
-    def __init__(self, in_ch: int = 2, out_ch: int = 32, k: int = 5, fs: float = 50e6):
-        super().__init__()
-        self.layer = nn.Sequential(
-            PlainFirstLayer(in_ch=in_ch, out_ch=out_ch, k=k, fs=fs),
-            nn.BatchNorm2d(out_ch),
-            nn.ReLU(inplace=True),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.layer(x)
-
-
 class PerturbAwareNet(nn.Module):
     """保留原 Backbone/Head 的分类模型。"""
 
     def __init__(self, n_classes: int, fs: float = 50e6):
         super().__init__()
-        self.first = GroupConvFirstLayer(in_ch=2, out_ch=32, k=5, fs=fs)
+        self.first = GroupConvFirstLayer(in_ch=2, out_ch=32, k=5)
         self.features = _make_backbone()
         self.pool = nn.AdaptiveAvgPool2d((1, 1))
         self.classifier = nn.Sequential(
