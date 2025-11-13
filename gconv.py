@@ -1,157 +1,155 @@
 #!/usr/bin/env python
 # -*- coding:utf-8 -*-
+"""群等变卷积层实现。
+
+该模块提供用于 IQ 信号的一维群等变卷积算子，不再依赖任何扰动标签或参数。
+"""
+
+from __future__ import annotations
+
+import math
+from typing import Optional
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# 扰动顺序固定，与数据生成一致
-PERTURB_ORDER = ['CFO', 'SCALE', 'GAIN', 'SHIFT', 'CHIRP']
 
-# ---------- 基础核操作（逐样本） ----------
-def _mix_IQ_by_phase_per_sample(w, phi):
+def rotate_complex_kernel(weight: torch.Tensor, angle: torch.Tensor) -> torch.Tensor:
+    """对卷积核的 IQ 通道施加复数相位旋转。
+
+    参数:
+        weight: [OC, IC, 1, k] 结构的核权重，要求前两个输入通道为 I/Q。
+        angle:  标量张量或 Python 标量，表示旋转角度（弧度）。
+    返回:
+        旋转后的权重张量，形状与 ``weight`` 相同。
     """
-    w:   [B, OC, IC, 1, kW]   (IC>=2，通道0=I, 通道1=Q)
-    phi: [B, kW]
-    返回对每个样本施加相位旋转后的核
+    if weight.size(1) < 2:
+        return weight
+
+    angle = torch.as_tensor(angle, dtype=weight.dtype, device=weight.device)
+    c = torch.cos(angle).view(1, 1, 1, 1)
+    s = torch.sin(angle).view(1, 1, 1, 1)
+
+    real = weight[:, 0:1, :, :]
+    imag = weight[:, 1:2, :, :]
+
+    rotated_real = real * c - imag * s
+    rotated_imag = real * s + imag * c
+
+    rotated = weight.clone()
+    rotated[:, 0:1, :, :] = rotated_real
+    rotated[:, 1:2, :, :] = rotated_imag
+    if weight.size(1) > 2:
+        rotated[:, 2:, :, :] = weight[:, 2:, :, :]
+    return rotated
+
+
+class GroupConv1xK(nn.Module):
+    """一维 ``1×k`` 群等变卷积。
+
+    通过对基础卷积核施加一组预定义的复数相位旋转来构造群元素，实现对
+    IQ 平面上相位旋转群的等变性。
     """
-    B, OC, IC, _, kW = w.shape
-    if IC < 2:
-        return w
-    I = w[:, :, 0, 0, :]                  # [B,OC,kW]
-    Q = w[:, :, 1, 0, :]
-    c = torch.cos(phi).unsqueeze(1)       # [B,1,kW]
-    s = torch.sin(phi).unsqueeze(1)
-    I2 = I * c - Q * s
-    Q2 = I * s + Q * c
-    w2 = w.clone()
-    w2[:, :, 0, 0, :] = I2
-    w2[:, :, 1, 0, :] = Q2
-    return w2
 
-def steer_scale_per_sample(w, alpha):
-    """
-    对核做时间尺度伸缩（线性插值到新长度再回到原长度）
-    w:     [B,OC,IC,1,kW]
-    alpha: [B] （1.0为不变）
-    """
-    B, OC, IC, _, kW = w.shape
-    ker = w.view(B * OC * IC, 1, kW)
-    out = []
-    start = 0
-    for b in range(B):
-        a = torch.clamp(alpha[b], min=1e-3)
-        new_W = int(torch.clamp((kW / a).round(), min=1).item())
-        seg = ker[start:start + OC * IC]
-        seg2 = F.interpolate(seg, size=new_W, mode='linear', align_corners=False)
-        seg3 = F.interpolate(seg2, size=kW,   mode='linear', align_corners=False)
-        out.append(seg3)
-        start += OC * IC
-    ker2 = torch.cat(out, dim=0)
-    return ker2.view(B, OC, IC, 1, kW)
-
-def steer_cfo_per_sample(w, fs, f0):
-    """对核施加载频偏移相位：phi = 2π f0 n / fs"""
-    kW = w.shape[-1]
-    n  = torch.arange(kW, device=w.device, dtype=torch.float32)[None, :]
-    phi = 2.0 * torch.pi * f0[:, None] * n / fs
-    return _mix_IQ_by_phase_per_sample(w, phi)
-
-def steer_chirp_per_sample(w, fs, a):
-    """对核施加二次相位：phi = π a t^2"""
-    kW = w.shape[-1]
-    n  = torch.arange(kW, device=w.device, dtype=torch.float32)[None, :]
-    t  = n / fs
-    phi = torch.pi * a[:, None] * (t ** 2)
-    return _mix_IQ_by_phase_per_sample(w, phi)
-
-def steer_gain_per_sample(w, rho):
-    """复增益幅度缩放（相位固定为0；相位扰动已在 CFO/CHIRP 里处理）"""
-    return rho[:, None, None, None, None] * w
-
-def steer_shift_per_sample(w, k):
-    """循环移位（样本级）"""
-    if torch.all(k == 0): return w
-    w2 = w.clone()
-    for b in range(w.shape[0]):
-        s = int(k[b].item())
-        if s != 0:
-            w2[b] = torch.roll(w2[b], shifts=s, dims=-1)
-    return w2
-
-# ---------- 最简“有群”第一层 ----------
-class SteerableFirstLayer(nn.Module):
-    """
-    纯群等变第一层：
-      - 基核: Conv2d(in=2, out=out_ch, kernel=(1,k))
-      - 逐样本核转向（SCALE→CFO→CHIRP→GAIN→SHIFT）
-      - grouped conv 实现逐样本不同核
-    约定输入:
-      x: [B, 2, 1, L]
-      z: [B, 5]  (0/1，是否激活对应扰动)
-      s: [B, 5]  (扰动参数; 对未激活项可为任意值/NaN)
-    """
-    def __init__(self, in_ch=2, out_ch=32, k=5, fs=50e6):
+    def __init__(
+        self,
+        in_channels: int,
+        out_channels: int,
+        kernel_size: int,
+        *,
+        n_group_elements: int = 4,
+        bias: bool = False,
+        padding: Optional[int] = None,
+    ) -> None:
         super().__init__()
-        self.fs = float(fs)
-        self.base = nn.Conv2d(in_ch, out_ch, kernel_size=(1, k),
-                              padding=(0, k // 2), bias=False)
-        nn.init.kaiming_uniform_(self.base.weight, a=0.2, nonlinearity='relu')
+        if n_group_elements < 1:
+            raise ValueError("n_group_elements must be >= 1")
 
-    def forward(self, x, z, s):
-        assert x.dim() == 4 and x.size(1) == 2, "x应为[B,2,1,L]"
-        assert z is not None and s is not None, "本层为纯群版本，需要同时提供 z/s"
-        B, _, _, L = x.shape
-        fs = torch.tensor(self.fs, dtype=torch.float32, device=x.device)
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size
+        self.n_group_elements = n_group_elements
+        self.padding = kernel_size // 2 if padding is None else padding
 
-        # 基核复制到每个样本
-        w0 = self.base.weight                         # [OC,IC,1,kW]
-        wB = w0.unsqueeze(0).expand(B, *w0.shape).contiguous()  # [B,OC,IC,1,kW]
+        self.weight = nn.Parameter(
+            torch.empty(out_channels, in_channels, 1, kernel_size)
+        )
+        if bias:
+            self.bias = nn.Parameter(torch.zeros(out_channels))
+        else:
+            self.register_parameter("bias", None)
 
-        # 依序对激活样本做核转向（未激活的样本保持单位/中性）
-        def apply_if(tag, neutral, fn):
-            idx = PERTURB_ORDER.index(tag)
-            active = (z[:, idx] > 0.5)
-            if not torch.any(active):  # 无激活则跳过
-                return
-            p = torch.nan_to_num(s[:, idx])
-            # 构造“全体参数=neutral，激活样本=真实参数”的向量
-            full = torch.full_like(p, neutral)
-            full[active] = p[active]
-            nonlocal wB
-            if tag == 'SCALE':
-                wB = steer_scale_per_sample(wB, full)
-            elif tag == 'CFO':
-                wB = steer_cfo_per_sample(wB, fs, full)
-            elif tag == 'CHIRP':
-                wB = steer_chirp_per_sample(wB, fs, full)
-            elif tag == 'GAIN':
-                wB = steer_gain_per_sample(wB, full)
-            elif tag == 'SHIFT':
-                wB = steer_shift_per_sample(wB, full.round())
+        angles = torch.arange(n_group_elements, dtype=torch.float32)
+        angles = angles * (2.0 * math.pi / n_group_elements)
+        self.register_buffer("angles", angles)
 
-        apply_if('SCALE', 1.0, steer_scale_per_sample)
-        apply_if('CFO',   0.0, steer_cfo_per_sample)
-        apply_if('CHIRP', 0.0, steer_chirp_per_sample)
-        apply_if('GAIN',  1.0, steer_gain_per_sample)
-        apply_if('SHIFT', 0.0, steer_shift_per_sample)
+        self.reset_parameters()
 
-        # grouped conv 实现逐样本不同权重
-        OC, IC, _, kW = w0.shape
-        xG = x.reshape(1, B * IC, 1, L)                # [1,B*IC,1,L]
-        wG = wB.reshape(B * OC, IC, 1, kW)             # [B*OC,IC,1,kW]
-        yG = F.conv2d(xG, wG, bias=None, stride=1, padding=(0, kW // 2), groups=B)
-        return yG.view(B, OC, 1, L)
+    def reset_parameters(self) -> None:
+        nn.init.kaiming_uniform_(self.weight, a=math.sqrt(5))
+        if self.bias is not None:
+            fan_in, _ = nn.init._calculate_fan_in_and_fan_out(self.weight)
+            bound = 1 / math.sqrt(fan_in) if fan_in > 0 else 0
+            nn.init.uniform_(self.bias, -bound, bound)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        kernels = [
+            rotate_complex_kernel(self.weight, angle.to(dtype=self.weight.dtype))
+            for angle in self.angles
+        ]
+        weight = torch.cat(kernels, dim=0)
+        bias: Optional[torch.Tensor]
+        if self.bias is not None:
+            bias = self.bias.repeat(self.n_group_elements)
+        else:
+            bias = None
+        return F.conv2d(x, weight, bias=bias, stride=1, padding=(0, self.padding))
+
+
+class GroupConvFirstLayer(nn.Module):
+    """网络的第一层：群等变卷积 + BN + ReLU。"""
+
+    def __init__(
+        self,
+        in_ch: int = 2,
+        out_ch: int = 32,
+        k: int = 5,
+        *,
+        n_group_elements: int = 4,
+        bias: bool = False,
+    ) -> None:
+        super().__init__()
+        if out_ch % n_group_elements != 0:
+            raise ValueError("out_ch must be divisible by n_group_elements")
+
+        base_channels = out_ch // n_group_elements
+        self.group_conv = GroupConv1xK(
+            in_channels=in_ch,
+            out_channels=base_channels,
+            kernel_size=k,
+            n_group_elements=n_group_elements,
+            bias=bias,
+        )
+        self.bn = nn.BatchNorm2d(base_channels * n_group_elements)
+        self.act = nn.ReLU(inplace=True)
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x = self.group_conv(x)
+        x = self.bn(x)
+        return self.act(x)
 
 
 class PlainFirstLayer(nn.Module):
-    """最简单的第一层：不做任何核转向，仅使用基础卷积。"""
+    """最简单的第一层：标准卷积 + BN + ReLU。"""
 
-    def __init__(self, in_ch=2, out_ch=32, k=5, fs=50e6):
+    def __init__(self, in_ch: int = 2, out_ch: int = 32, k: int = 5) -> None:
         super().__init__()
-        self.base = nn.Conv2d(in_ch, out_ch, kernel_size=(1, k),
-                              padding=(0, k // 2), bias=False)
-        nn.init.kaiming_uniform_(self.base.weight, a=0.2, nonlinearity='relu')
+        self.layer = nn.Sequential(
+            nn.Conv2d(in_ch, out_ch, kernel_size=(1, k), padding=(0, k // 2), bias=False),
+            nn.BatchNorm2d(out_ch),
+            nn.ReLU(inplace=True),
+        )
 
-    def forward(self, x, z=None, s=None):
-        assert x.dim() == 4 and x.size(1) == 2, "x应为[B,2,1,L]"
-        return self.base(x)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.layer(x)
